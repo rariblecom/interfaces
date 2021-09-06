@@ -18,17 +18,87 @@ abstract contract ExchangeV2Core is Initializable, OwnableUpgradeable, AssetMatc
     uint256 private constant UINT256_MAX = 2 ** 256 - 1;
 
     //state of the orders
-    mapping(bytes32 => uint) public fills;
+    mapping(bytes32 => uint) public fills; // take-side fills
+
+    //on-chain orders
+    mapping(bytes32 => OrderAndFee) public onChainOrders;
+
+    //struct to hold on-chain order and its protocol fee, fee is updated if order is updated
+    struct OrderAndFee {
+        LibOrder.Order order;
+        uint fee;
+    }
 
     //events
     event Cancel(bytes32 hash, address maker, LibAsset.AssetType makeAssetType, LibAsset.AssetType takeAssetType);
     event Match(bytes32 leftHash, bytes32 rightHash, address leftMaker, address rightMaker, uint newLeftFill, uint newRightFill, LibAsset.AssetType leftAsset, LibAsset.AssetType rightAsset);
+    event UpsertOrder(LibOrder.Order order);
+    
+    /// @dev Creates new or updates an on-chain order
+    function upsertOrder(LibOrder.Order memory order) external payable {
+        bytes32 orderKeyHash = LibOrder.hashKey(order);
+
+        //checking if order is correct
+        require(_msgSender() == order.maker, "order.maker must be msg.sender");
+        require(order.takeAsset.value > fills[orderKeyHash], "such take value is already filled");
+        
+        uint newTotal = getTotalValue(order, orderKeyHash);
+
+        //value of makeAsset that needs to be transfered with tx 
+        uint sentValue = newTotal;
+
+        if(checkOrderExistance(orderKeyHash)) {
+            uint oldTotal = getTotalValue(onChainOrders[orderKeyHash].order, orderKeyHash);
+
+            sentValue = (newTotal > oldTotal) ? newTotal.sub(oldTotal) : 0;
+
+            //value of makeAsset that needs to be returned to order.maker due to updating of the order
+            uint returnValue = (oldTotal > newTotal) ? oldTotal.sub(newTotal) : 0;
+
+            transferLockedAsset(LibAsset.Asset(order.makeAsset.assetType, returnValue), address(this), order.maker, UNLOCK, TO_MAKER);
+        }
+
+        if (order.makeAsset.assetType.assetClass == LibAsset.ETH_ASSET_CLASS) {
+            require(order.takeAsset.assetType.assetClass != LibAsset.ETH_ASSET_CLASS, "wrong order: ETH to ETH trades are forbidden");
+            require(msg.value >= sentValue, "not enough eth");
+
+            if (sentValue > 0) {
+                emit Transfer(LibAsset.Asset(order.makeAsset.assetType, sentValue), order.maker, address(this), TO_LOCK, LOCK);
+            }
+
+            //returning "change" ETH if msg.value > sentValue
+            if (msg.value > sentValue) {
+                address(order.maker).transferEth(msg.value.sub(sentValue));
+            }
+        } else {
+            //locking only ETH for now, not locking tokens
+        }
+
+        onChainOrders[orderKeyHash].fee = getProtocolFee();
+        onChainOrders[orderKeyHash].order = order;
+
+        emit UpsertOrder(order);
+    }
 
     function cancel(LibOrder.Order memory order) external {
         require(_msgSender() == order.maker, "not a maker");
         require(order.salt != 0, "0 salt can't be used");
+
         bytes32 orderKeyHash = LibOrder.hashKey(order);
+
+        //if it's an on-chain order
+        if (checkOrderExistance(orderKeyHash)) {
+            LibOrder.Order memory temp = onChainOrders[orderKeyHash].order;
+
+            //for now locking only ETH, so returning only locked ETH also
+            if (temp.makeAsset.assetType.assetClass == LibAsset.ETH_ASSET_CLASS) {
+                transferLockedAsset(LibAsset.Asset(temp.makeAsset.assetType, getTotalValue(temp, orderKeyHash)), address(this), temp.maker, UNLOCK, TO_MAKER);
+            }
+            delete onChainOrders[orderKeyHash];
+        }
+
         fills[orderKeyHash] = UINT256_MAX;
+
         emit Cancel(orderKeyHash, order.maker, order.makeAsset.assetType, order.takeAsset.assetType);
     }
 
@@ -66,19 +136,27 @@ abstract contract ExchangeV2Core is Initializable, OwnableUpgradeable, AssetMatc
         }
 
         (uint totalMakeValue, uint totalTakeValue) = doTransfers(makeMatch, takeMatch, newFill, orderLeft, orderRight);
-        if (makeMatch.assetClass == LibAsset.ETH_ASSET_CLASS) {
+
+        emit Match(leftOrderKeyHash, rightOrderKeyHash, orderLeft.maker, orderRight.maker, newFill.takeValue, newFill.makeValue, makeMatch, takeMatch);
+
+        bool ethRequired = matchingRequiresEth(orderLeft, orderRight, leftOrderKeyHash, rightOrderKeyHash);
+
+        if (makeMatch.assetClass == LibAsset.ETH_ASSET_CLASS && ethRequired) {
             require(takeMatch.assetClass != LibAsset.ETH_ASSET_CLASS);
             require(msg.value >= totalMakeValue, "not enough eth");
             if (msg.value > totalMakeValue) {
                 address(msg.sender).transferEth(msg.value.sub(totalMakeValue));
             }
-        } else if (takeMatch.assetClass == LibAsset.ETH_ASSET_CLASS) {
+        } else if (takeMatch.assetClass == LibAsset.ETH_ASSET_CLASS && ethRequired) {
             require(msg.value >= totalTakeValue, "not enough eth");
             if (msg.value > totalTakeValue) {
                 address(msg.sender).transferEth(msg.value.sub(totalTakeValue));
             }
         }
-        emit Match(leftOrderKeyHash, rightOrderKeyHash, orderLeft.maker, orderRight.maker, newFill.takeValue, newFill.makeValue, makeMatch, takeMatch);
+
+        deleteFilledOrder(orderLeft, leftOrderKeyHash);
+        deleteFilledOrder(orderRight, rightOrderKeyHash);
+
     }
 
     function getOrderFill(LibOrder.Order memory order, bytes32 hash) internal view returns (uint fill) {
@@ -98,8 +176,82 @@ abstract contract ExchangeV2Core is Initializable, OwnableUpgradeable, AssetMatc
 
     function validateFull(LibOrder.Order memory order, bytes memory signature) internal view {
         LibOrder.validate(order);
+
+        //no need to validate signature of an on-chain order
+        if (isTheSameAsOnChain(order, LibOrder.hashKey(order))) {
+            return;
+        } 
+
         validate(order, signature);
     }
 
-    uint256[49] private __gap;
+    /// @dev Checks order for existance on-chain by orderKeyHash
+    function checkOrderExistance(bytes32 orderKeyHash) public view returns(bool) {
+        if(onChainOrders[orderKeyHash].order.maker != address(0)) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /// @dev Tranfers assets to lock or unlock them
+    function transferLockedAsset(LibAsset.Asset memory asset, address from, address to, bytes4 transferType, bytes4 transferDirection) internal {
+        if (asset.value == 0) {
+            return;
+        }
+
+        transfer(asset, from, to, transferDirection, transferType);
+    }
+
+    /// @dev Calculates total make amount of order, including fees and fill
+    function getTotalValue(LibOrder.Order memory order, bytes32 hash) internal view returns(uint) {
+        (uint remainingMake, ) = LibOrder.calculateRemaining(order, getOrderFill(order, hash));
+        uint totalAmount = calculateTotalAmount(remainingMake, getOrderProtocolFee(order, hash), LibOrderData.parse(order).originFees);
+        return totalAmount;
+    }
+
+    /// @dev Checks if order is fully filled, if true then deletes it
+    function deleteFilledOrder(LibOrder.Order memory order, bytes32 hash) internal {
+        if (!isTheSameAsOnChain(order, hash)) { 
+            return;
+        }
+
+        uint takeValueLeft = order.takeAsset.value.sub(getOrderFill(order, hash));
+        if (takeValueLeft == 0) {
+            delete onChainOrders[hash];
+        }
+    }
+
+    /// @dev Checks if matching such orders requires ether sent with the transaction
+    function matchingRequiresEth(
+        LibOrder.Order memory orderLeft, 
+        LibOrder.Order memory orderRight,
+        bytes32 leftOrderKeyHash,
+        bytes32 rightOrderKeyHash
+    ) internal view returns(bool) {
+        //ether is required when one of the orders is simultaneously offchain and has makeAsset = ETH
+        if (orderLeft.makeAsset.assetType.assetClass == LibAsset.ETH_ASSET_CLASS) {
+            if (!isTheSameAsOnChain(orderLeft, leftOrderKeyHash)) {
+                return true;
+            }
+        }
+
+        if (orderRight.makeAsset.assetType.assetClass == LibAsset.ETH_ASSET_CLASS) {
+            if (!isTheSameAsOnChain(orderRight, rightOrderKeyHash)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// @dev Checks if order is the same as his on-chain version
+    function isTheSameAsOnChain(LibOrder.Order memory order, bytes32 hash) internal view returns(bool) {
+        if (LibOrder.hash(order) == LibOrder.hash(onChainOrders[hash].order)) {
+            return true;
+        }
+        return false;
+    }
+
+    uint256[48] private __gap;
 }
