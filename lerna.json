@@ -5,6 +5,7 @@
 		"exchange-v2",
 		"interfaces",
 		"lazy-mint",
+		"meta-tx",
 		"royalties",
 		"staking",
 		"royalties-registry",
